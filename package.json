@@ -1,0 +1,4 @@
+{
+  "name": "lambda-s3-upload",
+  "packageManager": "yarn@4.12.0"
+}
