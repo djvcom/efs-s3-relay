@@ -1,6 +1,7 @@
 {
 	"name": "efs-s3-relay",
 	"version": "1.0.0",
+	"license": "MIT",
 	"type": "module",
 	"packageManager": "yarn@4.12.0",
 	"engines": {

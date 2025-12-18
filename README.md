@@ -286,4 +286,4 @@ Integration tests use MinIO via testcontainers for realistic S3 operations.
 
 ## Licence
 
-ISC
+MIT
