@@ -207,7 +207,9 @@ This prevents overlapping executions. If EventBridge triggers while an invocatio
 
 ### OpenTelemetry Layer
 
-Add the AWS Distro for OpenTelemetry (ADOT) Lambda layer for trace export:
+You'll need a Lambda extension to export traces. A couple of options:
+
+**AWS Distro for OpenTelemetry (ADOT)** - the official AWS option:
 
 ```yaml
 Layers:
@@ -218,6 +220,8 @@ Environment:
     OTEL_SERVICE_NAME: zip-relay
     OTEL_EXPORTER_OTLP_ENDPOINT: https://your-collector:4318
 ```
+
+**[opentelemetry-lambda-extension](https://github.com/djvcom/lambda-observability/tree/main/crates/opentelemetry-lambda-extension)** - a lightweight Rust-based alternative. It's faster and has lower cold start overhead than ADOT, but you'll need to build and deploy the layer yourself. Worth a look if you're sensitive to cold start times.
 
 The esbuild configuration includes the OpenTelemetry instrumentation plugin for automatic AWS SDK tracing.
 
