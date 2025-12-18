@@ -387,7 +387,7 @@ describe.skipIf(!canRunIntegrationTests)('Handler Integration Tests', () => {
 			const result = await handler(createScheduledEvent(), createTestContext());
 
 			// Should only process 2 zips
-			expect(result.results).toHaveLength(2);
+			expect(result.zipsProcessed + result.zipsFailed).toBe(2);
 
 			// Remaining zips should still be in source
 			const sourceFiles = await readdir(sourceDir);
