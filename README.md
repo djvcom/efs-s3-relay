@@ -94,18 +94,28 @@ export const S3Bucket = (value: string): S3Bucket => {
 };
 ```
 
-### 4. Configuration Validation
+### 4. Configuration with Layerfig + Zod
 
-Environment variables validated at startup with Zod, failing fast on misconfiguration:
+Configuration uses [Layerfig](https://github.com/djvcom/layerfig) for layered config loading (defaults → environment variables) with Zod schemas for validation. This gives you type-safe config that fails fast on startup if something's wrong:
 
 ```typescript
+import { createEnvSource, createStaticSource, loadConfig } from 'layerfig';
+
 const rawConfigSchema = z.object({
   SOURCE_DIR: z.string().min(1),
   DESTINATION_BUCKET: z.string().min(3).max(63),
   BATCH_SIZE: z.preprocess(coerceNumber, z.number().int().positive()).optional(),
   // ...
 }).strict();
+
+// Layer defaults under environment variables
+const config = loadConfig(rawConfigSchema, [
+  createStaticSource({ BATCH_SIZE: 100, TIMEOUT_BUFFER_MS: 30000 }),
+  createEnvSource({ prefix: 'APP_' }),
+]);
 ```
+
+Layerfig handles the layering and prefix stripping, Zod handles validation and type coercion.
 
 ### 5. Testing Strategy
 
