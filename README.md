@@ -1,229 +1,288 @@
-# zip-relay
+# Lambda Reference Implementation: EFS to S3 Pipeline
 
-AWS Lambda function for processing zip files from an EFS-mounted filesystem, extracting contents, and uploading to S3. Designed for constrained Lambda environments with streaming extraction and batched uploads.
+> A demonstrator project showcasing production-grade patterns for AWS Lambda functions with OpenTelemetry observability, Result-based error handling, and robust testing strategies.
 
-## Features
+## Purpose
 
-- **Streaming zip extraction**: Uses `yauzl` for memory-efficient extraction
-- **Configurable content parsing**: Regex-based filename extraction and filtering
-- **Batched S3 uploads**: UUID-prefixed batches for S3 request rate distribution
-- **Partial failure handling**: Continues processing when individual files fail
-- **Timeout awareness**: Gracefully stops before Lambda timeout
-- **File routing**: Moves processed zips to archive/failed directories
-- **OpenTelemetry instrumentation**: Full tracing with manual spans and auto-instrumentation
+This repository is a **reference implementation** demonstrating how to build a well-architected Lambda function. While the specific use case (processing zip files from EFS and uploading to S3) is real, the primary goal is to showcase patterns you can adopt in your own serverless applications:
 
-## Environment Variables
+- **OpenTelemetry instrumentation** with semantic conventions for FaaS
+- **Result-based error handling** that makes failures explicit and composable
+- **Branded types** for compile-time safety of domain values
+- **Streaming architectures** for memory-constrained environments
+- **Comprehensive testing** including integration tests with testcontainers
 
-All environment variables use the `APP_` prefix.
+## Patterns Demonstrated
+
+### 1. OpenTelemetry Instrumentation
+
+The project uses [@semantic-lambda](https://github.com/djvcom/semantic-lambda) for handler wrapping with automatic FaaS semantic conventions, plus manual spans for business logic:
+
+```typescript
+// Handler wrapping with automatic FaaS attributes
+import { eventbridgeTrigger, wrap } from '@semantic-lambda/core';
+
+export const handler = wrap(
+  tracer,
+  eventbridgeTrigger,
+  async (event, context) => { /* ... */ }
+);
+
+// Manual spans for business operations
+return tracer.startActiveSpan('zip.process', { kind: SpanKind.INTERNAL }, async span => {
+  span.setAttribute('app.archive.path', zipPath);
+  // ... processing logic
+  span.setAttribute('app.files.extracted', count);
+  span.setStatus({ code: SpanStatusCode.OK });
+  span.end();
+});
+```
+
+**What you get automatically from `@semantic-lambda/core`:**
+- `faas.invocation_id` - Lambda request ID
+- `faas.name` - Function name
+- `faas.trigger` - Trigger type (pubsub for EventBridge)
+- `faas.coldstart` - Cold start detection
+- Proper span naming following `{source} {detail-type}` convention
+
+**Manual spans in this project:**
+| Span Name | Purpose | Key Attributes |
+|-----------|---------|----------------|
+| `batch.process` | Overall batch orchestration | `app.config.*`, `app.batch.stopped_early` |
+| `filesystem.list_zips` | Directory listing | `app.file.directory`, `app.zip.count` |
+| `zip.process` | Individual zip processing | `app.archive.path`, `app.files.*` |
+| `s3.upload_batch` | Batched S3 uploads | `aws.s3.bucket`, `rpc.system`, `rpc.service` |
+
+### 2. Result-Based Error Handling
+
+Instead of throwing exceptions, operations return `Result<T, E>` types using [true-myth](https://true-myth.js.org/):
+
+```typescript
+// Operations return Result types, making errors explicit
+const listResult = await tryListZipFiles(cfg.sourceDir, cfg.minFileAgeMs);
+
+if (listResult.isErr) {
+  span.setStatus({ code: SpanStatusCode.ERROR, message: listResult.error.message });
+  return Result.err(listResult.error);
+}
+
+// Continue with success path
+const { files, oldestAgeMs } = listResult.value;
+```
+
+**Benefits:**
+- Errors are values, not control flow
+- TypeScript enforces handling of error cases
+- Composable error transformations
+- Clear distinction between expected failures and unexpected exceptions
+
+### 3. Branded Types for Domain Safety
+
+Primitive types are branded to prevent mixing incompatible values:
+
+```typescript
+// These are incompatible at compile time
+type S3Bucket = Brand<string, 'S3Bucket'>;
+type S3Key = Brand<string, 'S3Key'>;
+type FilePath = Brand<string, 'FilePath'>;
+
+// Constructor validates and brands
+export const S3Bucket = (value: string): S3Bucket => {
+  const error = validateS3Bucket(value);
+  if (error) throw new Error(formatS3BucketError(error));
+  return value as S3Bucket;
+};
+```
+
+### 4. Configuration Validation
+
+Environment variables validated at startup with Zod, failing fast on misconfiguration:
+
+```typescript
+const rawConfigSchema = z.object({
+  SOURCE_DIR: z.string().min(1),
+  DESTINATION_BUCKET: z.string().min(3).max(63),
+  BATCH_SIZE: z.preprocess(coerceNumber, z.number().int().positive()).optional(),
+  // ...
+}).strict();
+```
+
+### 5. Testing Strategy
+
+**Unit tests** with dependency isolation:
+- `aws-sdk-client-mock` for S3 operations
+- `vi.mock` for filesystem and extraction
+- `@semantic-lambda/testing` for OTel span verification
+
+**Integration tests** with real dependencies:
+- MinIO via testcontainers for S3
+- Real filesystem operations
+- Full handler execution
+
+```typescript
+// OTel span testing
+const spans = getExporter().getFinishedSpans();
+const processSpan = spans.find(s => s.name === 'zip.process');
+
+expect(processSpan?.attributes['app.files.extracted']).toBe(2);
+expect(processSpan?.status.code).toBe(SpanStatusCode.OK);
+```
+
+## The Use Case
+
+This Lambda processes zip files deposited on an EFS mount by an external system:
+
+1. **Trigger**: EventBridge schedule (e.g., every minute)
+2. **Input**: Zip files in EFS directory
+3. **Processing**: Stream-extract, parse content, filter, batch
+4. **Output**: XML files uploaded to S3 with UUID prefixes
+5. **Cleanup**: Move zips to archive or failed directory
+
+```
+EFS (/mnt/efs/input)          Lambda Handler              S3 Bucket
+    │                              │                          │
+    ├── batch-001.zip ──────────▶ Extract & Parse ─────────▶ prefix/uuid/file1.xml
+    ├── batch-002.zip              │                          prefix/uuid/file2.xml
+    └── ...                        │
+                                   ▼
+                         EFS (/mnt/efs/archive)
+                              └── batch-001.zip
+```
+
+## Quick Start
+
+```bash
+# Install dependencies
+yarn install
+
+# Run tests
+yarn test
+
+# Run with coverage
+yarn test:coverage
+
+# Type check
+yarn typecheck
+
+# Lint and format
+yarn check
+yarn format
+
+# Build for Lambda
+yarn build
+```
+
+## Configuration
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `APP_SOURCE_DIR` | Yes | - | Directory containing zip files to process |
-| `APP_ARCHIVE_DIR` | Yes | - | Directory for successfully processed zips |
+| `APP_SOURCE_DIR` | Yes | - | Directory containing zip files |
+| `APP_ARCHIVE_DIR` | Yes | - | Directory for processed zips |
 | `APP_FAILED_DIR` | Yes | - | Directory for failed zips |
 | `APP_DESTINATION_BUCKET` | Yes | - | S3 bucket for uploads |
 | `APP_S3_PREFIX_BASE` | No | `""` | Base prefix for S3 keys |
-| `APP_BATCH_SIZE` | No | `100` | Files per S3 batch (for rate limiting) |
-| `APP_MAX_FILES_PER_INVOCATION` | No | `1000` | Max zips to process per invocation |
-| `APP_TIMEOUT_BUFFER_MS` | No | `30000` | Stop processing this many ms before timeout |
+| `APP_BATCH_SIZE` | No | `100` | Files per upload batch |
+| `APP_MAX_FILES_PER_INVOCATION` | No | `1000` | Max zips per invocation |
+| `APP_TIMEOUT_BUFFER_MS` | No | `30000` | Stop buffer before timeout |
 | `APP_FILENAME_PATTERN` | No | - | Regex to extract filename from content |
-| `APP_FILTER_PATTERN` | No | - | Regex to filter out matching content |
-| `APP_DELETE_ON_SUCCESS` | No | `false` | Delete zips instead of archiving |
+| `APP_FILTER_PATTERN` | No | - | Regex to filter matching content |
+| `APP_DELETE_ON_SUCCESS` | No | `false` | Delete instead of archive |
 
-## Configuration Examples
+## Deployment Considerations
 
-### Filename Extraction
+### Concurrency Control
 
-Extract transaction ID from XML content to use as filename:
+For scheduled triggers, use **reserved concurrency = 1**:
 
-```bash
-APP_FILENAME_PATTERN='<transactionId>(.*?)</transactionId>'
+```yaml
+ZipRelayFunction:
+  Type: AWS::Lambda::Function
+  Properties:
+    ReservedConcurrentExecutions: 1
+    Timeout: 300
+    MemorySize: 512
 ```
 
-Input: `<root><transactionId>TXN-12345</transactionId></root>`
-Output filename: `TXN-12345.xml`
+This prevents overlapping executions. If EventBridge triggers while an invocation is running, Lambda throttles (no retry), and the next scheduled trigger processes remaining files.
 
-### Content Filtering
+### OpenTelemetry Layer
 
-Skip files matching a pattern (e.g., test transactions):
+Add the AWS Distro for OpenTelemetry (ADOT) Lambda layer for trace export:
 
-```bash
-APP_FILTER_PATTERN='<locationId>PERF-TEST</locationId>'
+```yaml
+Layers:
+  - !Sub arn:aws:lambda:${AWS::Region}:901920570463:layer:aws-otel-nodejs-amd64-ver-1-18-1:1
+Environment:
+  Variables:
+    AWS_LAMBDA_EXEC_WRAPPER: /opt/otel-handler
+    OTEL_SERVICE_NAME: zip-relay
+    OTEL_EXPORTER_OTLP_ENDPOINT: https://your-collector:4318
 ```
 
-## IAM Permissions
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["s3:PutObject"],
-      "Resource": "arn:aws:s3:::your-bucket/*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": [
-        "elasticfilesystem:ClientMount",
-        "elasticfilesystem:ClientWrite"
-      ],
-      "Resource": "arn:aws:efs:region:account-id:file-system/fs-xxxxxxxx"
-    }
-  ]
-}
-```
-
-## Development
-
-```bash
-yarn install        # Install dependencies
-yarn build          # Bundle for Lambda using esbuild
-yarn test           # Run tests
-yarn test:watch     # Run tests in watch mode
-yarn test:coverage  # Run tests with coverage
-yarn typecheck      # TypeScript type checking
-yarn format         # Format code with Biome
-yarn lint           # Lint code with Biome
-yarn check          # Run all Biome checks
-```
+The esbuild configuration includes the OpenTelemetry instrumentation plugin for automatic AWS SDK tracing.
 
 ## Architecture
 
 ```
 src/
 ├── index.ts              # Lambda handler orchestration
-├── config.ts             # Zod schema + env loader
+├── config.ts             # Zod schema + layerfig env loader
+├── constants.ts          # Service name/version
+├── result/               # Result type utilities (true-myth wrapper)
+├── errors/               # Typed error hierarchy
+├── types/
+│   └── branded.ts        # Branded types (S3Bucket, S3Key, FilePath)
 ├── archive/
 │   ├── extractor.ts      # Streaming zip extraction (yauzl)
-│   └── types.ts          # ExtractedFile types
+│   └── types.ts          # ExtractedFile interface
 ├── content/
 │   └── parser.ts         # Regex-based content inspection
 ├── upload/
 │   ├── batcher.ts        # Groups files with UUID prefixes
-│   └── uploader.ts       # S3 PutObject with tracing
-└── routing/
-    └── file_router.ts    # Archive/failed directory management
+│   └── uploader.ts       # Batched S3 PutObject with tracing
+├── routing/
+│   └── file_router.ts    # Archive/failed directory management
+├── telemetry/
+│   ├── attributes.ts     # Attribute builder utilities
+│   ├── logger.ts         # OTel-aware SDK logger
+│   └── with_span.ts      # Span wrapper helpers
+└── metrics/
+    ├── slo.ts            # SLO metrics (oldest zip age, success rate)
+    └── resource_monitor.ts # Memory/CPU tracking
 ```
 
-## Processing Flow
+## Test Coverage
 
 ```
-EFS (source_dir)
-    │
-    ├── batch-001.zip
-    ├── batch-002.zip
-    └── ...
-         │
-         ▼
-    Lambda Handler
-         │
-         ├── List zip files (up to max_files_per_invocation)
-         ├── For each zip:
-         │   ├── Stream extract with yauzl
-         │   ├── For each extracted file:
-         │   │   ├── Apply filter pattern (skip if match)
-         │   │   └── Extract filename from content
-         │   ├── Batch files (100 per batch)
-         │   ├── Upload batches to S3 with UUID prefix
-         │   └── Route zip to archive/failed
-         └── Return BatchResult
-         │
-         ▼
-    S3 Bucket
-         │
-         └── {prefix}/{uuid}/{filename}.xml
+161 tests across 10 test files
+
+├── Handler orchestration   21 tests
+├── Branded types           59 tests
+├── Archive extraction      15 tests
+├── File routing            13 tests
+├── Config validation       11 tests
+├── S3 uploader             10 tests
+├── Error types             10 tests
+├── Content parser           8 tests
+├── OTel spans               8 tests
+└── Batcher                  6 tests
 ```
 
-## Response Format
+Integration tests use MinIO via testcontainers for realistic S3 operations.
 
-```typescript
-{
-  zipsProcessed: number;
-  zipsFailed: number;
-  totalFilesUploaded: number;
-  totalFilesFailed: number;
-  totalFilesFiltered: number;
-  results: ZipProcessResult[];
-  stoppedEarly: boolean;
-}
-```
+## What to Take Away
 
-## Deployment
+1. **Wrap handlers with semantic conventions** - Use libraries like `@semantic-lambda/core` to get consistent FaaS attributes automatically
 
-### Lambda Configuration
+2. **Add manual spans for business logic** - Your custom operations need visibility too; name them meaningfully and add domain-specific attributes
 
-- **Runtime**: Node.js 24.x
-- **Handler**: `index.handler`
-- **Memory**: 256 MB minimum
-- **Timeout**: 300 seconds (5 minutes) recommended
-- **Architecture**: x86_64 or arm64
-- **Reserved Concurrency**: 1 (required for scheduled triggers)
+3. **Make errors explicit** - Result types force you to handle failures and make error flows visible in code review
 
-### Concurrency Control for Scheduled Triggers
+4. **Brand your domain types** - `S3Bucket` and `string` are not the same; let the compiler help you
 
-When running on a schedule (e.g., EventBridge cron), configure **reserved concurrency = 1** to prevent overlapping executions. This ensures:
+5. **Test your telemetry** - Spans are behaviour; verify they're created with correct attributes
 
-1. **No duplicate processing**: Only one instance processes files at a time
-2. **Graceful throttling**: If the previous invocation is still running when the schedule triggers, Lambda returns a throttle error. EventBridge does not retry throttled invocations.
-3. **Natural catch-up**: The next scheduled trigger will process remaining files
-
-**Recommended configuration:**
-
-| Setting | Value | Rationale |
-|---------|-------|-----------|
-| Reserved Concurrency | 1 | Prevents overlap |
-| Timeout | 300s (5 min) | Allows batch completion |
-| `TIMEOUT_BUFFER_MS` | 30000 | Stops 30s before timeout |
-| `MAX_FILES_PER_INVOCATION` | 50-100 | Tune based on file size |
-| Schedule Rate | 1 minute | Frequent polling for new files |
-
-**CloudFormation example:**
-
-```yaml
-ZipRelayFunction:
-  Type: AWS::Lambda::Function
-  Properties:
-    FunctionName: zip-relay
-    Runtime: nodejs24.x
-    Handler: index.handler
-    Timeout: 300
-    ReservedConcurrentExecutions: 1
-    MemorySize: 512
-    FileSystemConfigs:
-      - Arn: !GetAtt EfsAccessPoint.Arn
-        LocalMountPath: /mnt/efs
-    Environment:
-      Variables:
-        APP_SOURCE_DIR: /mnt/efs/input
-        APP_ARCHIVE_DIR: /mnt/efs/archive
-        APP_FAILED_DIR: /mnt/efs/failed
-        APP_DESTINATION_BUCKET: !Ref DestinationBucket
-        APP_MAX_FILES_PER_INVOCATION: "100"
-
-ZipRelaySchedule:
-  Type: AWS::Events::Rule
-  Properties:
-    ScheduleExpression: rate(1 minute)
-    State: ENABLED
-    Targets:
-      - Id: ZipRelayTarget
-        Arn: !GetAtt ZipRelayFunction.Arn
-```
-
-**Behaviour matrix:**
-
-| Scenario | Outcome |
-|----------|---------|
-| Schedule triggers, no running instance | Normal execution |
-| Schedule triggers, instance running | Throttled (no retry) |
-| Instance completes before timeout | All files processed, moves to archive |
-| Timeout approaching | `stoppedEarly: true`, remaining files processed next invocation |
-| Individual file fails | Continues processing, zip moved to failed directory |
-
-### OpenTelemetry
-
-Add an OpenTelemetry Lambda layer (e.g., AWS Distro for OpenTelemetry). The esbuild plugin automatically instruments AWS SDK and fs operations.
+6. **Use testcontainers** - Real S3 (MinIO) catches issues mocks don't
 
 ## Licence
 
