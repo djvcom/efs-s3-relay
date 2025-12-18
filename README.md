@@ -270,6 +270,26 @@ src/
 
 Integration tests use MinIO via testcontainers for realistic S3 operations.
 
+## Known Testing Gaps
+
+The test suite is solid for a reference implementation, but there are areas I haven't covered due to time constraints. If you're adopting these patterns, you might want to add:
+
+**Error scenario coverage:**
+- IAM permission failures (mocking `AccessDenied` from S3)
+- S3 throttling and retry behaviour (503 `SlowDown` responses)
+- EFS-specific failures (cross-device rename errors, stale file handles)
+
+**Integration test additions:**
+- Idempotency verification (what happens if the same zip gets processed twice?)
+- Large-scale runs (500-1000 files per zip) to validate memory and timeout assumptions
+- Partial upload cleanup (if 99 files upload and 1 fails, what state are we left in?)
+
+**Unit test gaps:**
+- Resource monitor (`src/metrics/resource_monitor.ts`) has no coverage
+- Content parser edge cases: malformed XML, very large documents, binary content masquerading as text
+
+None of these are blockers for understanding the patterns, but they'd be worth adding before running this in production.
+
 ## What to Take Away
 
 1. **Wrap handlers with semantic conventions** - Use libraries like `@semantic-lambda/core` to get consistent FaaS attributes automatically
